@@ -28,35 +28,46 @@ set(PICO_BOARD pico2 CACHE STRING "Board type")
 # Pull in Raspberry Pi Pico SDK (must be before project)
 include(pico_sdk_import.cmake)
 
-project(sdCard C CXX ASM)
+project(sdCard-pico-2-driver C CXX ASM)
+
+# Enable exception handling
+set(PICO_CXX_ENABLE_EXCEPTIONS 1)
 
 # Initialise the Raspberry Pi Pico SDK
 pico_sdk_init()
 
 # Add executable. Default name is the project name, version 0.1
 
-add_executable(sdCard sd.cpp sdcard.cpp )
+add_executable(
+    sdCard-pico-2-driver
+    sdcard.cpp
+    sd.cpp
+    diskio.c
+    ff.c
+    ffsystem.c
+    ffunicode.c
+)
 
-pico_set_program_name(sdCard "sdCard")
-pico_set_program_version(sdCard "0.1")
+pico_set_program_name(sdCard-pico-2-driver "sdCard-pico-2-driver")
+pico_set_program_version(sdCard-pico-2-driver "0.1")
 
 # Modify the below lines to enable/disable output over UART/USB
-pico_enable_stdio_uart(sdCard 0)
-pico_enable_stdio_usb(sdCard 1)
+pico_enable_stdio_uart(sdCard-pico-2-driver 0)
+pico_enable_stdio_usb(sdCard-pico-2-driver 1)
 
 # Add the standard library to the build
-target_link_libraries(sdCard
+target_link_libraries(sdCard-pico-2-driver
         pico_stdlib)
 
 # Add the standard include files to the build
-target_include_directories(sdCard PRIVATE
+target_include_directories(sdCard-pico-2-driver PRIVATE
         ${CMAKE_CURRENT_LIST_DIR}
 )
 
 # Add any user requested libraries
-target_link_libraries(sdCard 
+target_link_libraries(sdCard-pico-2-driver 
         hardware_spi
         )
 
-pico_add_extra_outputs(sdCard)
+pico_add_extra_outputs(sdCard-pico-2-driver)
 

@@ -1,299 +1,314 @@
-//    _____          _         _____           _           _     __                     
-//   / ____|        | |       |  __ \         | |         | |   / _|                    
-//  | |     ___   __| | ___   | |__) |__  _ __| |_ ___  __| |  | |_ _ __ ___  _ __ ___  
-//  | |    / _ \ / _` |/ _ \  |  ___/ _ \| '__| __/ _ \/ _` |  |  _| '__/ _ \| '_ ` _ \ 
-//  | |___| (_) | (_| |  __/  | |  | (_) | |  | ||  __/ (_| |  | | | | | (_) | | | | | |
-//   \_____\___/ \__,_|\___|  |_|   \___/|_|   \__\___|\__,_|  |_| |_|  \___/|_| |_| |_|
-//    _____ ____      _____                                             _
-//   / ____|  _ \    / ____|                                           | |              
-//  | (___ | |_) |  | |     ___  _ __ ___  _ __   ___  _ __   ___ _ __ | |_ ___         
-//   \___ \|  _ <   | |    / _ \| '_ ` _ \| '_ \ / _ \| '_ \ / _ \ '_ \| __/ __|        
-//   ____) | |_) |  | |___| (_) | | | | | | |_) | (_) | | | |  __/ | | | |_\__ \        
-//  |_____/|____/    \_____\___/|_| |_| |_| .__/ \___/|_| |_|\___|_| |_|\__|___/        
-//                                        | |                                           
-//                                        |_|    
+// Copyright (c) 20xx gronktonkbabonk
 
-// They wrote all the logic, not me!
-// https://github.com/sbcshop/MicroSD-Breakout
-
-
-// possible fix for a future bug: if only 1/8 of the file is being read, remove /sizeof(uint8_t) when reading
-
-
+#include "sdHardware.h"
+#include "sdSoftware.h"
 #include <stdio.h>
 #include <string.h>
-#include <cstdint>
-#include <cmath>
 #include <stdexcept>
-#include <errno.h>
+#include <time.h> 
 #include "pico/stdlib.h"
 #include "hardware/spi.h"
+#include "ff.h"
+#include "diskio.h"
 
-const int CMD_TIMEOUT = 100;
+// Resources used:
+//2023 sd card physical layer simplified spec
+//https://github.com/sbcshop/MicroSD-Breakout/blob/main/sdcard.py -> implementation example
+//https://nodeloop.org/guides/sd-card-spi-init-guide/
+//https://electronics.stackexchange.com/questions/77417/what-is-the-correct-command-sequence-for-microsd-card-initialization-in-spi
+//https://elm-chan.org/fsw/ff/ -> lots of stuff here
+//https://www.programming-electronics-diy.xyz/2022/07/sd-card-tutorial-interfacing-sd-card.html
+//duckduckgo lol
 
-const int R1_IDLE_STATE = 1<<0;
-const int R1_ILLEGAL_COMMAND = 1 << 2;
-const uint8_t TOKEN_FF = 0xFF;
-const uint8_t TOKEN_00 = 0x00;
-const char TOKEN_CMD25 = 0xFC;
-const char TOKEN_STOP_TRAIN = 0xFD;
-const char TOKEN_DATA = 0xFE;
+#define TRY(x) do {int res = (x); if (res != 0) return res;}while(0) //forgive me father for i have sinned
 
-class SDCard
-{
-    public:
-        uint8_t tokenbuf[1] = {};  
-        spi_inst_t *spi;
-        int cs;
-        int sectors;
-        int cdv;
-        int nblocks;
-        SDCard(spi_inst_t *spiInp, int csInp);
-        void init_card();
-        void init_card_v1();
-        void init_card_v2();
-        void readinto(uint8_t buf[]);
-        int cmd(int cmd, int arg, uint8_t crc, int final = 0, bool release=true, bool skip1=true);
-        void write(char token, uint8_t buf[], int cycles=0);
-        void write_token(char token);
-        void writeblocks(int block_num, uint8_t buf[]);
-        void readblocks(int block_num, uint8_t buf[]);
-        int ioctl(int op);
-};
+spi_inst_t *spi;
+bool debug;
+uint8_t response[16];
+uint64_t capacity = 0;
+int addrMult;
+bool initialised = false;
+int cs;
+int cd;
 
-SDCard::SDCard(spi_inst_t *spiInp, int csInp)
-{
-    spi = spiInp;
-    cs = csInp;
+uint64_t bitSlicer(uint8_t buf[], size_t width, int startLoc, int arrSize){
+    startLoc = arrSize-1-startLoc;
+    uint64_t returnNum = 0;
+    for(size_t i = 0; i < width; i++) returnNum |= ((buf[(startLoc+i)/8] >> (7-((startLoc+i)%8)))&1)<<(width-1-i);
+    return returnNum;
 }
 
-void SDCard::init_card(){
-    spi_init(spi, 100*1000); //100Khz slower for init i guess? hey dude i just work here
-    uint8_t enterToken[16];
-    memset(enterToken, TOKEN_FF, 16);
-    gpio_put(cs, 0);
-    spi_write_blocking(spi, enterToken, 16);
+int getCardSize(int ver){
+    cmd(9,0,0,0,false,false);
 
-    bool sdExists = false;
+    uint8_t reply;    
+    int cmdtimeout = CMD_TIMEOUT;
+    do{
+        spi_read_blocking(spi, FF_TOKEN, &reply,1);
+        cmdtimeout--;
+    }while (reply != DATA_START && cmdtimeout > 0);
+    if(cmdtimeout == 0) return fatalErr("timeout while waiting for csd register.", FR_NOT_READY);
+    spi_read_blocking(spi, FF_TOKEN, response, 16);
+    gpio_put(cs,1);   
+    FFClock(2);
+   
+    if (ver == 1){
+        int READ_BL_LEN = bitSlicer(response, 4, 83,128);
+        int C_SIZE_MULT = bitSlicer(response, 3, 78,128);
+        int C_SIZE = bitSlicer(response, 12, 54,128);
+        int BLOCK_LEN = 1<<READ_BL_LEN;
+        int MULT = 1<<(C_SIZE_MULT+2);
+        int BLOCKNR = (C_SIZE+1)*MULT;
+        capacity = BLOCKNR * BLOCK_LEN;
+    }else{
+        uint64_t C_SIZE = bitSlicer(response,22,69,128);
+        capacity = ((C_SIZE+1ull) << 19);
+    }
+    return 0;
+}
 
-    for (size_t i = 0; i < 5; i++){
-        if (cmd(0,0,0x95)==R1_IDLE_STATE) {
-            sdExists = true;
+extern "C" int initialiseCard(){
+    if (initialised) return 0;
+    sleep_ms(1);
+    if(debug) printf("init started \n");
+    spi_init(spi, 1000*100); // clock rate to 400khz for init  
+    spi_set_format(spi, 8, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
+    FFClock(10);
+
+    bool present = false;
+    for (size_t i = 0; i < 5; i++)
+    {
+        if(cmd(0,0,0x95,0,true,false) == 0x01){
+            present=true;
             break;
         }
     }
-    if(!sdExists) std::runtime_error("no SD card is present :( (or no response is being returned at all)");
+    if(!present) return fatalErr("No sd card is present.", FR_NOT_READY);
+    
+    //card is present
+    if(debug) printf("Card is present\n");
 
-    // now we can be confident the sd card is present!
+    int cmd8res = cmd(8, 0x1AA, 0x87, 4, true,false);
+    if(cmd8res == R1_IDLE_STATE) TRY(v2Init()); //v2 card present
+    else if(cmd8res == R1_ILLEGAL_COMMAND) TRY(v1Init());
+    else return fatalErr("Bad response from SD, unable to determine version.", FR_NOT_READY);
 
-    int r = cmd(8,0x01AA,0x67, false);
-
-    if(r==R1_IDLE_STATE){
-        init_card_v2();
-    } else if (r==(R1_IDLE_STATE | R1_ILLEGAL_COMMAND)){
-        init_card_v1();
-    } else{
-        std::runtime_error("Can't determine SD card version :(");
-    }
-
-    // now we know the sd card version also isnt that awesome
-
-    // get number of sectors
-    // CMD9: response R2 (R1 byte + 16-byte block read)
-
-    if (cmd(9,0,0,0, false)!=0){
-        std::runtime_error("No response from SD card :/");
-    }
-    uint8_t csd[16] = {};
-    memset(csd,0,16); // i dont think this is necessary but its nice to have a zeroed array
-    readinto(csd);
-    if (csd[0] & 0xC0 == 0x40){
-        sectors = ((csd[8] << 8 | csd[9]) + 1) * 1024;
-    } else if (csd[0] & 0xC0 == 0x00){
-        int c_size = csd[6] & 0b11 | csd[7] << 2 | (csd[8] & 0b11000000) << 4;
-        int c_size_mult = ((csd[9] & 0b11) << 1) | csd[10] >> 7;
-        sectors = (c_size + 1) * (pow(2, (c_size_mult + 2)));
-    } else{
-        std::runtime_error("Sd card format not supported");
-    }
-
-    if (cmd(16, 512, 0) != 0){
-        std::runtime_error("can't set block size to 512");
-    }
-
-
-    spi_init(spi, 1000*1000); //1Mhz speed up for data transmission
+    printf("Sd card init successful! \n");
+    printf("Detected card capacity: %f GB\n",(float)capacity/(float)1000000000);
+    spi_init(spi,1000*1000*25);
+    initialised = true;
+    return 0;
 }
 
-void SDCard::init_card_v1(){
-    for(size_t i = 0; i<CMD_TIMEOUT;i++){
-        cmd(55,0,0);
-        if(cmd(41,0,0) == 0){
-            cdv = 512;
-            return;
-        }
-    }
-    std::runtime_error("Timeout while waiting for v1 card init");
+int v2Init(){
+    if(debug) printf("v2 card detected\n");
+    if((response[2] & 0x0F) != 0x01) return fatalErr("v2 voltage out of range, Unusable card.", FR_NOT_READY);
+    
+    int timeout = CMD_TIMEOUT;
+    uint8_t r1 = 0;
+    if(debug) printf("started 55/41\n");
+    do
+    {
+        cmd(55,0,0x65,0,false,false);  
+        r1=cmd(41,0x40000000, 0,0,true,false);
+    } while (r1 != 0x00 && timeout--);
+    if (timeout==0) return fatalErr("Failed to initialise v2 card, timed out while waiting.", FR_NOT_READY);
+    gpio_put(cs,1);
+    FFClock();
+    if(debug) printf("ended 55/41 in %i cycles\n", CMD_TIMEOUT-timeout);
+    
+    cmd(58, 0, 0xfd, 4,true,false);
+    uint32_t ocr = (response[0] << 24)|(response[1] << 16)|(response[2] << 8)|response[3]; //reconstructing ocr
+    if (!(ocr & 0x00FF8000)) return fatalErr("v2 OCR voltage out of range, Unusable card.", FR_NOT_READY);
+    if(debug) printf("v2 ocr voltage in range.\n");
+
+    TRY(getCardSize(2));
+    addrMult = (((ocr >> 30) & 1)? 1 : 512);
+    return 0;
 }
 
-void SDCard::init_card_v2(){
-    for(size_t i = 0; i<CMD_TIMEOUT;i++){
-        sleep_ms(50);
-        cmd(58,0,0,4);
-        cmd(55,0,0);
-        if(cmd(41,0x40000000,0) == 6){
-            cmd(58,0,0,4);
-            cdv = 1;
-            return;
-        }
-    }
-    std::runtime_error("Timeout while waiting for v2 card init");
+int v1Init(){
+    if(debug) printf("v1 card detected\n");
+
+    
+    int timeout = CMD_TIMEOUT;
+    uint8_t r1;
+    if(debug) printf("started 55/41\n");
+    do
+    {
+        cmd(55,0,0x65, 0,  false,false);  
+        r1=cmd(41,0, 0, 0,true,false);
+    } while ((r1 != 0x00) && timeout--);
+    if (timeout==0) return fatalErr("Failed to initialise v1 card, timed out while waiting.", FR_NOT_READY);
+    gpio_put(cs,1);
+    FFClock();
+    if(debug) printf("ended 55/41 in %i cycles\n", CMD_TIMEOUT-timeout);
+    
+    
+    cmd(58, 0, 0xfd, 4,  true, false);
+    uint32_t ocr = (response[0] << 24)|(response[1] << 16)|(response[2] << 8)|response[3]; //reconstructing ocr
+    if (!(ocr & 0x00FF8000)) return fatalErr("v1 OCR voltage out of range, Unusable card.", FR_NOT_READY);
+    if(debug) printf("v1 ocr voltage in range.\n");
+    
+    cmd(16, 512, 0, 0, true, false);
+    TRY(getCardSize(1));
+    addrMult = 512;
+    return 0;    
 }
 
-void SDCard::readinto(uint8_t buf[]){
-    gpio_put(cs, 0);
-    bool response = false;
+int cmd(uint8_t cmd, uint32_t args, uint8_t crc, int extraResponseBytes, bool release, bool skip1){
+    gpio_put(cs,0);
+    FFClock();
+    uint8_t buf[6] = {
+        (uint8_t) (cmd | 0x40), //  make sure the first two bits are 01, 0 is the start bit and 1 indicating this device is host
+        (uint8_t) (args >> 24),
+        (uint8_t) (args >> 16),
+        (uint8_t) (args >> 8),
+        (uint8_t) (args),
+        (uint8_t) (crc)
+    };
+
+    if (cmd != 41 && cmd != 55) if(debug) printf("cmd %u called \n", (unsigned int)cmd);
+    
+    memset(response, 0, 16);
+    
+    spi_write_blocking(spi, buf, 6); //this WILL hang forever if the breakout is not wired correctly
+    
+    if(skip1){
+        FFClock();
+    }
     for (size_t i = 0; i < CMD_TIMEOUT; i++){
-        spi_write_read_blocking(spi, &TOKEN_FF, tokenbuf, 1);
-        if (tokenbuf[0] = TOKEN_DATA){
-            response = true;
-            break;
+        uint8_t r1;
+        spi_read_blocking(spi, FF_TOKEN, &r1, 1);
+        if(!(r1&0x80)){ // checks the most significant bit of r1 is 1, which would indicate an error
+            if (cmd != 41 && cmd != 55) if(debug) printf("r1 read: 0x%02x\n",r1);
+            if(extraResponseBytes != 0){
+                spi_read_blocking(spi, FF_TOKEN,response, extraResponseBytes);
+                FFClock(2);
+                if(debug) printf("All extra response bytes finished\n");
+            }
+
+            if(release){
+                gpio_put(cs,1);
+                FFClock();
+            }
+            return r1;
         }
-        sleep_ms(1);
-    }
-    if (!response){
-        gpio_put(cs, 1);
-        std::runtime_error("Timeout waiting for response from Sd card :( got ghosted bruh");
     }
     
-    uint8_t mv[sizeof(buf)/sizeof(uint8_t)] = {};
-    memset(mv, 0, sizeof(mv)/sizeof(uint8_t));
-    spi_write_read_blocking(spi, buf, mv, sizeof(mv)/sizeof(uint8_t));
-
-    spi_write_blocking(spi, &TOKEN_FF, 1);
-    spi_write_blocking(spi, &TOKEN_FF, 1);
+    //timeout
     gpio_put(cs,1);
-    spi_write_blocking(spi, &TOKEN_FF, 1);
-}
-
-int SDCard::cmd(int cmd, int arg, uint8_t crc, int final = 0, bool release=true, bool skip1=false){
-    gpio_put(cs, 0);
-    uint8_t buf[6] = {
-        0x40|cmd,
-        arg >> 24,
-        arg >> 16,
-        arg >> 8,
-        arg,
-        crc
-    };
-    spi_write_blocking(spi, buf, 6);
-
-    if(skip1){
-        spi_write_read_blocking(spi, &TOKEN_FF, tokenbuf, 1);
-    }
-
-    for (size_t i = 0; i < CMD_TIMEOUT; i++){
-        spi_write_read_blocking(spi, &TOKEN_FF, tokenbuf, 1);
-        uint8_t response = tokenbuf[0];
-        if (!(response & 0x80)){
-            for (size_t j = 0; i < final; i++){
-                spi_write_blocking(spi, &TOKEN_FF, 1);
-            }
-            if (release){
-                gpio_put(cs, 1);
-                spi_write_blocking(spi, &TOKEN_FF, 1);
-            }
-            return response;
-            
-        }
-    }
-
-    gpio_put(cs, 1);
-    spi_write_blocking(spi, &TOKEN_FF, 1);
+    FFClock();
+    if(debug) printf("Timeout while waiting for cmd response \n");
     return -1;
 }
 
-void SDCard::write(char token, uint8_t buf[], int cycles=0){
-    gpio_put(cs,0);
-
-    uint8_t readinto;
-    spi_read_blocking(spi, token, &readinto, 1);
-    if(!cycles){
-        spi_write_blocking(spi, buf, sizeof(buf)/sizeof(uint8_t));
+extern "C" int readBlocks(uint8_t buf[], uint32_t blockAddr, unsigned int readNum){
+    blockAddr *= addrMult;
+    int readCmd = (readNum == 1)? 17 : 18;
+    int result = cmd(readCmd,blockAddr,0,0, false, false);
+    // if(debug) printf("cmd r1:%02x\n",result);
+    if(result != 0) return fatalErr("I/O error for read cmd", FR_DISK_ERR);
+    uint8_t reply;    
+    for (size_t i = 0; i < readNum; i++){
+        int cmdtimeout = CMD_TIMEOUT;
+        do{
+            spi_read_blocking(spi, FF_TOKEN, &reply,1);
+            cmdtimeout--;
+        }while (reply != DATA_START && cmdtimeout > 0);
+        if(cmdtimeout == 0) return fatalErr("Cmd timeout while waiting for response token", FR_DISK_ERR);
+        if (debug) printf("Start token detected\n");
+        spi_read_blocking(spi, FF_TOKEN, buf+(i*512), 512);
+        FFClock(2);
     }
-    
-    spi_write_blocking(spi, &TOKEN_FF, 1);
-    spi_write_blocking(spi, &TOKEN_FF, 1);
-
-    spi_read_blocking(spi, TOKEN_FF, &readinto, 1);
-    if(readinto&0x1F != 0x05){
-        gpio_put(cs, 1);
-        spi_write_blocking(spi, &TOKEN_FF, 1);
-        return;
-    }
-
-    gpio_put(cs, 1);
-    spi_write_blocking(spi, &TOKEN_FF, 1);
-
+    gpio_put(cs,1);    
+    if(readNum > 1){if(cmd(12,0,FF_TOKEN,0,true, true) == 0x01) return fatalErr("I/O error for multiread cmd.", FR_DISK_ERR);}
+    return RES_OK;
 }
 
-void SDCard::write_token(char token){
-    gpio_put(cs,0);
-    uint8_t readinto;
-    spi_read_blocking(spi, token, &readinto, 1);
-    spi_write_blocking(spi, &TOKEN_FF, 1);
+extern "C" int writeBlocks(const uint8_t buf[], uint32_t blockAddr, unsigned int writeNum){
+    blockAddr *= addrMult;
+    int writeCmd = (writeNum==1)? 24 : 25;
+    uint8_t startToken = (writeNum == 1)? 0xFE : 0xFC; // selecting which start token to use :3
+    if(cmd(writeCmd,blockAddr,0,0,false,false) != 0) return fatalErr("I/O error for write cmd", FR_DISK_ERR);
+    uint8_t response;
+    for (size_t i = 0; i < writeNum; i++){
+        spi_write_blocking(spi, &startToken, 1);    
+        spi_write_blocking(spi, buf+(i*512), 512);
+        FFClock(2); //crc :3
+        int cmdtimeout = CMD_TIMEOUT;
+        do{
+            spi_read_blocking(spi, FF_TOKEN, &response, 1);
+        } while(response == 0xFF && cmdtimeout-- > 0);
+        if(cmdtimeout == 0) return fatalErr("timeout waiting for block response", FR_DISK_ERR);
+        if ((response&0x1f) != 0x05) return fatalErr("error while writing block", FR_DISK_ERR);
+        cmdtimeout = CMD_TIMEOUT;
+        do{
+            spi_read_blocking(spi, FF_TOKEN, &response, 1);
+        } while(response == 0x00 && cmdtimeout-- > 0);
+        if(cmdtimeout == 0) return fatalErr("Timeout waiting for data write to finish.", FR_DISK_ERR);
+
+    }
+    if(writeNum>1) spi_write_blocking(spi, &STOP_TRAN, 1);
     gpio_put(cs,1);
-    spi_write_blocking(spi, &TOKEN_FF, 1);
-
+    FFClock();
+    return 0;
 }
 
-void SDCard::writeblocks(int block_num, uint8_t buf[]){
-    nblocks = (sizeof(buf)/sizeof(uint8_t)) /512;
-    int err = nblocks = (sizeof(buf)/sizeof(uint8_t)) % 512;
-    assert(("Buffer length is invalid", nblocks && !err));
-
-    if(nblocks==1){
-        if (cmd(24, block_num*cdv, 0) != 0){
-            errno= EIO;
-        }
-        write(TOKEN_DATA, buf);
-    } else{
-        if (cmd(25, block_num*cdv, 0) != 0){
-            errno= EIO;
-        }
-        int offset = 0;
-        uint8_t mv[sizeof(buf)/sizeof(uint8_t)];
-        for(size_t i=0;nblocks != 0;i+=512,nblocks--){
-            write(TOKEN_CMD25, &buf[i]);
-        }
-        memcpy(&mv, &buf, sizeof(buf)/sizeof(uint8_t));
+int FFClock(int clocks){
+    for (size_t i = 0; i < clocks; i++){
+        spi_write_blocking(spi, &FF_TOKEN, 1);
     }
+    // if(debug) printf("System clocked for %i byte(s)\n",clocks);
+    return 1;
 }
 
-void SDCard::readblocks(int block_num, uint8_t buf[]){
-    nblocks = sizeof(buf)/sizeof(uint8_t);
-    assert(("Invalid buffer length",nblocks && !((sizeof(buf)/sizeof(uint8_t))%512)));
-    if(nblocks==1){
-        if(cmd(17,block_num*cdv,0,0,false) != 0){
-            gpio_put(cs,1);
-            errno = EIO;
-        }
-        spi_read_blocking(spi, TOKEN_00,buf, sizeof(buf)/sizeof(uint8_t));
-    } else {
-        if(cmd(18,block_num*cdv,0,0,false) != 0){
-            gpio_put(cs,1);
-            errno = EIO;
-        }
-        int offset = 0;
-        uint8_t mv[sizeof(buf)/sizeof(uint8_t)];
-        memcpy(&mv, &buf, sizeof(buf)/sizeof(uint8_t));
-        for(size_t i=0;nblocks != 0;i+=512,nblocks--){
-            spi_read_blocking(spi,TOKEN_00, &buf[i], 512);
-        }
-        if (cmd(12, 0, 0xFF,0, true, true)) errno = EIO;
+int fatalErr(const char* errMessage, int err){
+    gpio_put(cs,1);
+    FFClock();
+    printf("----ERROR----: %s %02x\n",errMessage,err);
+    return err;
+}
+
+extern "C" int sdIoctl(unsigned int cmd, void* buf){
+    if (!initialised) return RES_NOTRDY;
+    switch (cmd){
+    case CTRL_SYNC:
+        return RES_OK;
+    case GET_SECTOR_COUNT:
+        *(LBA_t*)buf = (capacity/512)+1;
+        return RES_OK;
+    case GET_SECTOR_SIZE:
+        *(WORD*)buf=512;
+        return RES_OK;
+    case GET_BLOCK_SIZE:
+        *(DWORD*)buf = 1;
+        return RES_OK;
+    case CTRL_TRIM:
+        return RES_OK;
     }
+    return RES_PARERR;
 }
 
-int SDCard::ioctl(int op){
-    if (op == 4) return sectors;
+extern "C" int getStatus(){
+    if(!initialised) return STA_NOINIT;
+    if(gpio_get(cd) == 0) return STA_NODISK;
+    return 0;
+}
+
+extern "C" DWORD get_fattime (void)
+{
+    time_t t;
+    struct tm *stm;
+
+
+    t = time(0);
+    stm = localtime(&t);
+
+    return (DWORD)(stm->tm_year - 80) << 25 |
+           (DWORD)(stm->tm_mon + 1) << 21 |
+           (DWORD)stm->tm_mday << 16 |
+           (DWORD)stm->tm_hour << 11 |
+           (DWORD)stm->tm_min << 5 |
+           (DWORD)stm->tm_sec >> 1;
 }
