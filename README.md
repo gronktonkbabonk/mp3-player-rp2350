@@ -1,2 +1,2 @@
 # sdCard-pico-2-driver
-go away
+sudo screen /dev/ttyACM0 115200

@@ -69,7 +69,7 @@ int getCardSize(int ver){
 
 extern "C" int initialiseCard(){
     if (initialised) return 0;
-    sleep_ms(1);
+    sleep_ms(1); // it needs this to boot correctly
     if(debug) printf("init started \n");
     spi_init(spi, 1000*100); // clock rate to 400khz for init  
     spi_set_format(spi, 8, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);

@@ -101,8 +101,8 @@ int main(){
     }
 
 
-    fr = f_open(&fil, "poopy.txt", FA_WRITE | FA_CREATE_ALWAYS);
-    f_write(&fil, "a poo\r\n", 7, &bw);
+    fr = f_open(&fil, "test.txt", FA_WRITE | FA_CREATE_ALWAYS);
+    f_write(&fil, "Hello, World!\r\n", 15, &bw);
     f_close(&fil);
     printf("file closed\n");  
     f_unmount("");
