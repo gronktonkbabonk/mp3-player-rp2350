@@ -13,7 +13,7 @@
 /* Example: Declarations of the platform and disk functions in the project */
 // #include "platform.h"
 // #include "storage.h"
-#include "sdSoftware.h"
+#include "../sd-driver/ffFunc.h"
 
 /* Example: Mapping of physical drive number for each drive */
 // #define DEV_FLASH	0	/* Map FTL to physical drive 0 */

@@ -40,12 +40,15 @@ pico_sdk_init()
 
 add_executable(
     sdCard-pico-2-driver
-    sdcard.cpp
-    sd.cpp
-    diskio.c
-    ff.c
-    ffsystem.c
-    ffunicode.c
+
+    src/main/main.cpp
+
+    src/fatfs/diskio.c
+    src/fatfs/ff.c
+    src/fatfs/ffsystem.c
+    src/fatfs/ffunicode.c
+
+    src/sd-driver/driver.cpp
 )
 
 pico_set_program_name(sdCard-pico-2-driver "sdCard-pico-2-driver")

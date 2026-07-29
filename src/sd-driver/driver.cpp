@@ -1,15 +1,18 @@
 // Copyright (c) 20xx gronktonkbabonk
 
-#include "sdHardware.h"
-#include "sdSoftware.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdexcept>
 #include <time.h> 
+
 #include "pico/stdlib.h"
 #include "hardware/spi.h"
-#include "ff.h"
-#include "diskio.h"
+
+#include "ffFunc.h"
+#include "driver.h"
+
+#include "../fatfs/ff.h"
+#include "../fatfs/diskio.h"
 
 // Resources used:
 //2023 sd card physical layer simplified spec
@@ -22,16 +25,14 @@
 
 #define TRY(x) do {int res = (x); if (res != 0) return res;}while(0) //forgive me father for i have sinned
 
-spi_inst_t *spi;
-bool debug;
-uint8_t response[16];
+
+uint8_t response[16] = {0};
 uint64_t capacity = 0;
-int addrMult;
-bool initialised = false;
-int cs;
-int cd;
+int addrMult = 0;
+
 
 uint64_t bitSlicer(uint8_t buf[], size_t width, int startLoc, int arrSize){
+    
     startLoc = arrSize-1-startLoc;
     uint64_t returnNum = 0;
     for(size_t i = 0; i < width; i++) returnNum |= ((buf[(startLoc+i)/8] >> (7-((startLoc+i)%8)))&1)<<(width-1-i);
@@ -39,6 +40,7 @@ uint64_t bitSlicer(uint8_t buf[], size_t width, int startLoc, int arrSize){
 }
 
 int getCardSize(int ver){
+    
     cmd(9,0,0,0,false,false);
 
     uint8_t reply;    
@@ -74,6 +76,7 @@ extern "C" int initialiseCard(){
     spi_init(spi, 1000*100); // clock rate to 400khz for init  
     spi_set_format(spi, 8, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
     FFClock(10);
+    if(debug) printf("SPI initialised\n");
 
     bool present = false;
     for (size_t i = 0; i < 5; i++)
@@ -101,6 +104,7 @@ extern "C" int initialiseCard(){
 }
 
 int v2Init(){
+    
     if(debug) printf("v2 card detected\n");
     if((response[2] & 0x0F) != 0x01) return fatalErr("v2 voltage out of range, Unusable card.", FR_NOT_READY);
     
@@ -128,9 +132,9 @@ int v2Init(){
 }
 
 int v1Init(){
+    
     if(debug) printf("v1 card detected\n");
 
-    
     int timeout = CMD_TIMEOUT;
     uint8_t r1;
     if(debug) printf("started 55/41\n");
@@ -157,7 +161,7 @@ int v1Init(){
 }
 
 int cmd(uint8_t cmd, uint32_t args, uint8_t crc, int extraResponseBytes, bool release, bool skip1){
-    gpio_put(cs,0);
+    gpio_put(cs,0); 
     FFClock();
     uint8_t buf[6] = {
         (uint8_t) (cmd | 0x40), //  make sure the first two bits are 01, 0 is the start bit and 1 indicating this device is host
@@ -168,7 +172,7 @@ int cmd(uint8_t cmd, uint32_t args, uint8_t crc, int extraResponseBytes, bool re
         (uint8_t) (crc)
     };
 
-    if (cmd != 41 && cmd != 55) if(debug) printf("cmd %u called \n", (unsigned int)cmd);
+    if (cmd != 41 && cmd != 55) if(cmdDebug) printf("cmd %u called \n", (unsigned int)cmd);
     
     memset(response, 0, 16);
     
@@ -181,11 +185,11 @@ int cmd(uint8_t cmd, uint32_t args, uint8_t crc, int extraResponseBytes, bool re
         uint8_t r1;
         spi_read_blocking(spi, FF_TOKEN, &r1, 1);
         if(!(r1&0x80)){ // checks the most significant bit of r1 is 1, which would indicate an error
-            if (cmd != 41 && cmd != 55) if(debug) printf("r1 read: 0x%02x\n",r1);
+            if (cmd != 41 && cmd != 55) if(cmdDebug) printf("r1 read: 0x%02x\n",r1);
             if(extraResponseBytes != 0){
                 spi_read_blocking(spi, FF_TOKEN,response, extraResponseBytes);
                 FFClock(2);
-                if(debug) printf("All extra response bytes finished\n");
+                if(cmdDebug) printf("All extra response bytes finished\n");
             }
 
             if(release){
@@ -204,10 +208,12 @@ int cmd(uint8_t cmd, uint32_t args, uint8_t crc, int extraResponseBytes, bool re
 }
 
 extern "C" int readBlocks(uint8_t buf[], uint32_t blockAddr, unsigned int readNum){
+    
+    if (!initialised) return 3; //FR_NOT_READY
     blockAddr *= addrMult;
     int readCmd = (readNum == 1)? 17 : 18;
     int result = cmd(readCmd,blockAddr,0,0, false, false);
-    // if(debug) printf("cmd r1:%02x\n",result);
+    if(cmdDebug) printf("cmd r1:%02x\n",result);
     if(result != 0) return fatalErr("I/O error for read cmd", FR_DISK_ERR);
     uint8_t reply;    
     for (size_t i = 0; i < readNum; i++){
@@ -217,7 +223,7 @@ extern "C" int readBlocks(uint8_t buf[], uint32_t blockAddr, unsigned int readNu
             cmdtimeout--;
         }while (reply != DATA_START && cmdtimeout > 0);
         if(cmdtimeout == 0) return fatalErr("Cmd timeout while waiting for response token", FR_DISK_ERR);
-        if (debug) printf("Start token detected\n");
+        if (cmdDebug) printf("Start token detected\n");
         spi_read_blocking(spi, FF_TOKEN, buf+(i*512), 512);
         FFClock(2);
     }
@@ -227,6 +233,8 @@ extern "C" int readBlocks(uint8_t buf[], uint32_t blockAddr, unsigned int readNu
 }
 
 extern "C" int writeBlocks(const uint8_t buf[], uint32_t blockAddr, unsigned int writeNum){
+    
+    if (!initialised) return 3; //FR_NOT_READY
     blockAddr *= addrMult;
     int writeCmd = (writeNum==1)? 24 : 25;
     uint8_t startToken = (writeNum == 1)? 0xFE : 0xFC; // selecting which start token to use :3
@@ -259,7 +267,7 @@ int FFClock(int clocks){
     for (size_t i = 0; i < clocks; i++){
         spi_write_blocking(spi, &FF_TOKEN, 1);
     }
-    // if(debug) printf("System clocked for %i byte(s)\n",clocks);
+    if(cmdDebug) printf("System clocked for %i byte(s)\n",clocks);
     return 1;
 }
 
@@ -271,7 +279,8 @@ int fatalErr(const char* errMessage, int err){
 }
 
 extern "C" int sdIoctl(unsigned int cmd, void* buf){
-    if (!initialised) return RES_NOTRDY;
+    
+        if (!initialised) return 3; //FR_NOT_READY
     switch (cmd){
     case CTRL_SYNC:
         return RES_OK;
@@ -291,13 +300,14 @@ extern "C" int sdIoctl(unsigned int cmd, void* buf){
 }
 
 extern "C" int getStatus(){
+    
     if(!initialised) return STA_NOINIT;
     if(gpio_get(cd) == 0) return STA_NODISK;
     return 0;
 }
 
-extern "C" DWORD get_fattime (void)
-{
+extern "C" DWORD get_fattime (void){
+    
     time_t t;
     struct tm *stm;
 
