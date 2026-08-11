@@ -9,8 +9,10 @@
 #include "../sd-driver/driver.h"
 
 
-bool debug = false;
-bool cmdDebug = false;
+bool SDdebug = false;
+bool SDdebugDetailed = false;
+bool audioDebug = false;
+
 bool initialised = false;
 spi_inst_t *spi = SPI_PORT;
 int cs = PIN_CS;
@@ -48,34 +50,39 @@ void SDDriverInit(){
     gpio_put(cs,1);
 
     printf("Card inserted. Initialising...\n");
-    char ch;
-    printf("debug on? (y/enter)\n");
-    ch = getchar();
-    if (ch == 'y'){
-        debug = true;
-        printf("cmd debug on? (y/enter)\n");
-        ch = getchar();
-        if (ch == 'y'){
-            cmdDebug = true;
-        }
-    }
     return;
 }
 
 void init(){
     stdio_init_all();
 
+    // setup onboard led
+    gpio_init(ONBLED);
+    gpio_set_dir(ONBLED,GPIO_OUT);
+    
+    //setup debug pins
+    int debugPins[] = {
+        DEBUG_SD,
+        DEBUG_SD_DETAILED,
+        DEBUG_AUDIO
+    };
+
+    bool* debugVars[] = {
+        &SDdebug,
+        &SDdebugDetailed,
+        &audioDebug
+    };
+   
+    
+    //setup sd pins
     gpio_init(PIN_CD);
     gpio_set_dir(PIN_CD,GPIO_IN);
     gpio_pull_up(PIN_CD);
-    
     gpio_set_function(PIN_MISO, GPIO_FUNC_SPI);
     gpio_set_function(PIN_CS,   GPIO_FUNC_SIO);
     gpio_set_function(PIN_SCK,  GPIO_FUNC_SPI);
     gpio_set_function(PIN_MOSI, GPIO_FUNC_SPI);
-    gpio_init(ONBLED);
-    gpio_set_dir(ONBLED,GPIO_OUT);
-    
+
     gpio_put(ONBLED,1);
 
     while (!stdio_usb_connected()) {
@@ -88,14 +95,19 @@ void init(){
         sleep_ms(100);
     }
 
+    for (size_t i = 0; i < sizeof(debugPins)/sizeof(int); i++){
+        gpio_init(debugPins[i]);
+        gpio_set_dir(debugPins[i],GPIO_IN);
+        gpio_pull_up(debugPins[i]);
+        sleep_ms(1);
+        *debugVars[i] = gpio_get(debugPins[i]); // pull one out to enable it
+    }
+
     SDDriverInit();
 }
 
 int main(){
     init();
-
-    // bool debug = true;
-
     FATFS fat;
     DIR dir;
     FILINFO fno;
@@ -105,7 +117,7 @@ int main(){
 
     fr = f_mount(&fat, "", 0);
     if (fr == FR_OK){
-        printf("Mount OK!\n");
+        ("Mount OK!\n");
         
         
         fr = f_opendir(&dir, "/");
